@@ -1,0 +1,19 @@
+[package]
+name = "mzdata-converter"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[dependencies]
+mzdata = { version = "0.63", default-features = false, features = ["mzml", "thermo", "bruker_tdf", "parallelism", "nalgebra", "zlib-rs", "mgf"] }
+clap = { version = "4", features = ["derive"] }
+glob = "0.3"
+indicatif = "0.17"
+rayon = "1"
+mimalloc = "0.1"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
