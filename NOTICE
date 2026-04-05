@@ -1,0 +1,17 @@
+mzdata-converter
+
+This product includes software developed by third parties.
+
+--------------------------------------------------------------------------------
+
+Thermo RawFileReader
+Copyright (c) Thermo Fisher Scientific
+
+The Thermo RawFileReader library is included as a transitive dependency via the
+thermorawfilereader and dotnetrawfilereader-sys Rust crates. It is subject to
+Thermo Fisher Scientific's proprietary license terms. By using mzdata-converter
+with Thermo RAW file support, you accept the RawFileReader license agreement
+available at: https://github.com/thermofisherlsms/RawFileReader
+
+The RawFileReader library is Copyright (c) Thermo Fisher Scientific.
+Thermo Fisher Scientific does not endorse or promote this product.
