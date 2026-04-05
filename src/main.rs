@@ -8,15 +8,15 @@ use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::info;
+use mzdata::MZReader;
 use mzdata::io::mzml::MzMLWriterType;
 use mzdata::prelude::*;
-use mzdata::spectrum::bindata::BinaryCompressionType;
 use mzdata::spectrum::MultiLayerSpectrum;
-use mzdata::MZReader;
+use mzdata::spectrum::bindata::BinaryCompressionType;
 use rayon::prelude::*;
 
 const BATCH_SIZE: usize = 128;
@@ -61,8 +61,8 @@ fn expand_inputs(patterns: &[String]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for pattern in patterns {
         let mut matched = false;
-        for entry in glob::glob(pattern)
-            .with_context(|| format!("Invalid glob pattern: {pattern}"))?
+        for entry in
+            glob::glob(pattern).with_context(|| format!("Invalid glob pattern: {pattern}"))?
         {
             let path = entry.with_context(|| format!("Error reading glob match for: {pattern}"))?;
             if !files.contains(&path) {
@@ -247,10 +247,22 @@ fn main() -> Result<()> {
 
                 let pb = multi.add(ProgressBar::new(0));
                 pb.set_style(style);
-                pb.set_prefix(input.file_name().unwrap_or_default().to_string_lossy().to_string());
+                pb.set_prefix(
+                    input
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                );
 
-                let total =
-                    convert_file(&input, &output, do_peak_picking, sn_threshold, compression, &pb)?;
+                let total = convert_file(
+                    &input,
+                    &output,
+                    do_peak_picking,
+                    sn_threshold,
+                    compression,
+                    &pb,
+                )?;
 
                 pb.finish_with_message("done");
                 let _ = sem_tx.send(());

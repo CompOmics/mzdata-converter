@@ -1,0 +1,6 @@
+target/
+flamegraph.svg
+.git/
+.github/
+.claude/
+*.md
