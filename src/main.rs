@@ -1,3 +1,5 @@
+mod bruker;
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -89,7 +91,7 @@ fn output_path_for(input: &Path, output_dir: Option<&Path>) -> PathBuf {
     }
 }
 
-/// Configure vendor-native centroiding/consolidation on the reader.
+/// Configure vendor-native centroiding on the reader.
 fn configure_peak_picking(reader: &mut MZReader<fs::File>, input: &Path) {
     match reader {
         MZReader::ThermoRaw(thermo) => {
@@ -107,6 +109,183 @@ fn configure_peak_picking(reader: &mut MZReader<fs::File>, input: &Path) {
     }
 }
 
+/// Check if this is a Bruker .d directory.
+fn is_bruker_dir(path: &Path) -> bool {
+    path.is_dir()
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("d"))
+        && path.join("analysis.tdf").exists()
+}
+
+/// Build a MultiLayerSpectrum from raw m/z and intensity arrays.
+fn build_spectrum(
+    mzs: &[f64],
+    intensities: &[f32],
+    id: &str,
+    index: usize,
+    ms_level: u8,
+    time_seconds: f64,
+    precursor: Option<mzdata::spectrum::Precursor>,
+) -> MultiLayerSpectrum {
+    use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray as BinDataArray};
+
+    let mz_bytes: Vec<u8> = mzs.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let int_bytes: Vec<u8> = intensities.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let mut arrays = mzdata::spectrum::bindata::BinaryArrayMap::new();
+    arrays.add(BinDataArray::wrap(
+        &ArrayType::MZArray,
+        BinaryDataArrayType::Float64,
+        mz_bytes,
+    ));
+    arrays.add(BinDataArray::wrap(
+        &ArrayType::IntensityArray,
+        BinaryDataArrayType::Float32,
+        int_bytes,
+    ));
+
+    let mut spectrum: MultiLayerSpectrum = MultiLayerSpectrum::default();
+    spectrum.description.id = id.to_string();
+    spectrum.description.index = index;
+    spectrum.description.ms_level = ms_level;
+    spectrum.description.signal_continuity = mzdata::spectrum::SignalContinuity::Centroid;
+    spectrum
+        .description
+        .acquisition
+        .scans
+        .push(mzdata::spectrum::ScanEvent::default());
+    spectrum.description.acquisition.scans[0].start_time = time_seconds / 60.0;
+    spectrum.arrays = Some(arrays);
+    if let Some(p) = precursor {
+        spectrum.description.precursor.push(p);
+    }
+    spectrum
+}
+
+/// Convert a Bruker .d directory using the native SDK for fast centroiding.
+fn convert_bruker_sdk(
+    input: &Path,
+    output: &Path,
+    compression: BinaryCompressionType,
+    pb: &ProgressBar,
+    sdk_path: &Path,
+) -> Result<u64> {
+    let tdf_path = input.join("analysis.tdf");
+    let sdk = bruker::TimsDataHandle::open(sdk_path, input)?;
+    let ms1_frames: Vec<_> = bruker::read_frames(&tdf_path)?
+        .into_iter()
+        .filter(|f| f.ms_level == 1 && f.num_scans > 0)
+        .collect();
+    let precursors = bruker::read_precursors(&tdf_path)?;
+
+    // Group precursors by parent MS1 frame for interleaved output
+    let mut precursors_by_parent: std::collections::HashMap<i64, Vec<&bruker::PrecursorInfo>> =
+        std::collections::HashMap::new();
+    for p in &precursors {
+        precursors_by_parent
+            .entry(p.parent_frame)
+            .or_default()
+            .push(p);
+    }
+
+    let total = (ms1_frames.len() + precursors.len()) as u64;
+    pb.set_length(total);
+
+    let fh = BufWriter::with_capacity(
+        WRITER_BUF_SIZE,
+        fs::File::create(output)
+            .with_context(|| format!("Failed to create: {}", output.display()))?,
+    );
+    let mut writer = MzMLWriterType::new_with_index_and_compression(fh, true, compression);
+    writer.set_spectrum_count(total);
+
+    let mut spectrum_index: usize = 0;
+
+    for frame in &ms1_frames {
+        // MS1: extract centroided spectrum aggregated across all mobility scans
+        let (mzs, intensities) =
+            match sdk.extract_centroided_spectrum(frame.id, 0, frame.num_scans) {
+                Ok(result) => result,
+                Err(e) => {
+                    log::warn!("Skipping MS1 frame {}: {e}", frame.id);
+                    pb.inc(1);
+                    continue;
+                }
+            };
+
+        let spectrum = build_spectrum(
+            &mzs,
+            &intensities,
+            &format!("frame={}", frame.id),
+            spectrum_index,
+            1,
+            frame.time,
+            None,
+        );
+        spectrum_index += 1;
+        writer.write_owned(spectrum)?;
+        pb.inc(1);
+
+        // Write MS2 spectra for precursors selected from this MS1 frame
+        if let Some(precs) = precursors_by_parent.get(&frame.id) {
+            let precursor_ids: Vec<i64> = precs.iter().map(|p| p.id).collect();
+            let msms_data = match sdk.read_pasef_msms(&precursor_ids) {
+                Ok(data) => data,
+                Err(e) => {
+                    log::warn!("Skipping MS2 precursors for frame {}: {e}", frame.id);
+                    pb.inc(precs.len() as u64);
+                    continue;
+                }
+            };
+
+            for p in precs {
+                let (mzs, intensities) = match msms_data.get(&p.id) {
+                    Some(data) => data,
+                    None => {
+                        pb.inc(1);
+                        continue;
+                    }
+                };
+
+                let mut precursor = mzdata::spectrum::Precursor::default();
+                let selected_mz = p.monoisotopic_mz.unwrap_or(p.largest_peak_mz);
+                precursor.ions.push(mzdata::spectrum::SelectedIon {
+                    mz: selected_mz,
+                    charge: p.charge,
+                    intensity: p.intensity as f32,
+                    ..Default::default()
+                });
+                if let (Some(iso_mz), Some(iso_width)) = (p.isolation_mz, p.isolation_width) {
+                    precursor.isolation_window.target = iso_mz as f32;
+                    let half = iso_width as f32 / 2.0;
+                    precursor.isolation_window.lower_bound = half;
+                    precursor.isolation_window.upper_bound = half;
+                }
+                if let Some(ce) = p.collision_energy {
+                    precursor.activation.energy = ce as f32;
+                }
+
+                let spectrum = build_spectrum(
+                    mzs,
+                    intensities,
+                    &format!("precursor={}", p.id),
+                    spectrum_index,
+                    2,
+                    p.retention_time,
+                    Some(precursor),
+                );
+                spectrum_index += 1;
+                writer.write_owned(spectrum)?;
+                pb.inc(1);
+            }
+        }
+    }
+
+    writer.close()?;
+    Ok(total)
+}
+
 /// Convert a single file from its source format to indexed mzML.
 fn convert_file(
     input: &Path,
@@ -116,6 +295,15 @@ fn convert_file(
     compression: BinaryCompressionType,
     pb: &ProgressBar,
 ) -> Result<u64> {
+    // Try Bruker native SDK for .d directories
+    if is_bruker_dir(input) {
+        if let Some(sdk_path) = bruker::find_sdk_library() {
+            info!("Using Bruker native SDK: {}", sdk_path.display());
+            return convert_bruker_sdk(input, output, compression, pb, &sdk_path);
+        }
+        info!("Bruker SDK not found, falling back to timsrust");
+    }
+
     let mut reader = MZReader::open_path(input)
         .with_context(|| format!("Failed to open: {}", input.display()))?;
 
@@ -135,33 +323,34 @@ fn convert_file(
     writer.copy_metadata_from(&reader);
     writer.set_spectrum_count(total);
 
-    // Pre-fetch batches on a reader thread so rayon always has work
-    // while the main thread writes the previous batch.
-    let (tx, rx) = sync_channel::<Vec<MultiLayerSpectrum>>(2);
+    {
+        // Reader thread pre-fetches batches; main thread peak-picks in parallel + writes.
+        let (tx, rx) = sync_channel::<Vec<MultiLayerSpectrum>>(2);
 
-    let reader_handle = thread::spawn(move || {
-        let mut batch = Vec::with_capacity(BATCH_SIZE);
-        for spectrum in reader.iter() {
-            batch.push(spectrum);
-            if batch.len() >= BATCH_SIZE {
-                if tx.send(batch).is_err() {
-                    return;
+        let reader_handle = thread::spawn(move || {
+            let mut batch = Vec::with_capacity(BATCH_SIZE);
+            for spectrum in reader.iter() {
+                batch.push(spectrum);
+                if batch.len() >= BATCH_SIZE {
+                    if tx.send(batch).is_err() {
+                        return;
+                    }
+                    batch = Vec::with_capacity(BATCH_SIZE);
                 }
-                batch = Vec::with_capacity(BATCH_SIZE);
             }
-        }
-        if !batch.is_empty() {
-            let _ = tx.send(batch);
-        }
-    });
+            if !batch.is_empty() {
+                let _ = tx.send(batch);
+            }
+        });
 
-    for batch in rx {
-        process_and_write_batch(batch, do_peak_picking, sn_threshold, &mut writer, pb)?;
+        for batch in rx {
+            process_and_write_batch(batch, do_peak_picking, sn_threshold, &mut writer, pb)?;
+        }
+
+        reader_handle.join().expect("reader thread panicked");
     }
 
-    reader_handle.join().expect("reader thread panicked");
     writer.close()?;
-
     Ok(total)
 }
 

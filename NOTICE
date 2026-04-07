@@ -15,3 +15,13 @@ available at: https://github.com/thermofisherlsms/RawFileReader
 
 The RawFileReader library is Copyright (c) Thermo Fisher Scientific.
 Thermo Fisher Scientific does not endorse or promote this product.
+
+--------------------------------------------------------------------------------
+
+Bruker TDF-SDK
+Copyright (c) 2019 by Bruker Daltonik GmbH
+
+This software uses Bruker TDF-SDK software for reading Bruker timsTOF data
+files. The SDK libraries (timsdata.dll, libtimsdata.so) are redistributed
+under the Bruker Software License Agreement. See libs/LICENCE-BRUKER.txt for
+details. Bruker does not endorse or promote this product.

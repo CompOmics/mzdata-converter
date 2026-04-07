@@ -1,0 +1,9 @@
+This software uses Bruker TDF-SDK software.
+Copyright (c) 2019 by Bruker Daltonik GmbH. All rights reserved.
+
+The files timsdata.dll, libtimsdata.so, and libbaf2sql_c.so are proprietary
+Bruker libraries redistributed in accordance with the Bruker Software License
+Agreement (with the right to link to other software).
+
+These libraries may only be distributed as part of software that requires them
+to function. They may not be distributed under GPL or other copyleft licenses.
