@@ -28,8 +28,9 @@ fn ensure_extracted(archive: &str) -> Option<PathBuf> {
 
     if !dir_path.exists() {
         let parent = archive_path.parent().unwrap_or(Path::new("."));
+        let filename = archive_path.file_name().unwrap().to_str().unwrap();
         let status = Command::new("tar")
-            .args(["xzf", archive])
+            .args(["xzf", filename])
             .current_dir(parent)
             .status()
             .expect("Failed to run tar");
