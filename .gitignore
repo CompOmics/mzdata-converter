@@ -16,3 +16,8 @@ target
 # Agent-related files
 CLAUDE*
 .claude/
+
+# Test data: track compressed archives, not extracted directories
+tests/data/*/
+!tests/data/*.tar.gz
+!tests/data/*.raw

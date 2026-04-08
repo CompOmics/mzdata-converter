@@ -1320,6 +1320,7 @@ dependencies = [
  "mzdata",
  "rayon",
  "rusqlite",
+ "tempfile",
 ]
 
 [[package]]
