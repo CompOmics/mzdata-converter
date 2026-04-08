@@ -52,6 +52,11 @@ jobs:
           lfs: true
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install .NET 8 (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0'
       - run: cargo test
 
   docker:
