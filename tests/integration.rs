@@ -1,8 +1,8 @@
 //! Integration tests for mzdata-converter.
 //!
-//! Test data is stored as `.tar.gz` archives in `tests/data/` and extracted
-//! before each test. The archives are tracked in git; extracted directories
-//! are gitignored.
+//! Test data is stored as `.tar.gz` archives (via Git LFS) and `.RAW` files
+//! in `tests/data/`. Archives are extracted before each test. Extracted
+//! directories are gitignored.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -40,50 +40,95 @@ fn ensure_extracted(archive: &str) -> Option<PathBuf> {
     Some(dir_path.to_path_buf())
 }
 
-fn run_conversion(input: &Path) -> (bool, String, String) {
+#[test]
+fn test_dda_bruker_conversion() {
+    let Some(input) = ensure_extracted("tests/data/200ngHeLaPASEF_1min.d.tar.gz") else {
+        return;
+    };
+
     let output_dir = tempfile::tempdir().unwrap();
     let result = mzdata_converter()
-        .arg(input)
+        .arg(&input)
         .arg("-o")
         .arg(output_dir.path())
         .output()
         .expect("Failed to run mzdata-converter");
 
-    let stdout = String::from_utf8_lossy(&result.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&result.stderr).to_string();
-    (result.status.success(), stdout, stderr)
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "Conversion failed: {stderr}");
+
+    let mzml_path = output_dir.path().join("200ngHeLaPASEF_1min.mzML");
+    assert!(mzml_path.exists(), "Output mzML not created");
+
+    let content = std::fs::read_to_string(&mzml_path).unwrap();
+    let spectra = content.matches("</spectrum>").count();
+    assert!(spectra > 100, "Expected >100 spectra, got {spectra}");
+    assert!(
+        content.contains("\"ms level\" value=\"1\""),
+        "No MS1 spectra"
+    );
+    assert!(
+        content.contains("\"ms level\" value=\"2\""),
+        "No MS2 spectra"
+    );
+    assert!(content.contains("<indexedmzML"), "Not indexed mzML");
+    assert!(
+        content.contains("isolation window target m/z"),
+        "No isolation windows"
+    );
+    assert!(content.contains("collision energy"), "No collision energy");
 }
 
 #[test]
-fn test_dda_bruker_conversion() {
-    let Some(input) = ensure_extracted("tests/data/test.d.tar.gz") else {
+fn test_dia_bruker_conversion() {
+    let Some(input) =
+        ensure_extracted("tests/data/230711_idleflow_400-1000mz_25mz_diaPasef_10sec.d.tar.gz")
+    else {
         return;
     };
 
-    let (success, _, stderr) = run_conversion(&input);
-    assert!(success, "Conversion failed: {stderr}");
-}
+    let output_dir = tempfile::tempdir().unwrap();
+    let result = mzdata_converter()
+        .arg(&input)
+        .arg("-o")
+        .arg(output_dir.path())
+        .output()
+        .expect("Failed to run mzdata-converter");
 
-#[test]
-fn test_dia_test_conversion() {
-    let Some(input) = ensure_extracted("tests/data/dia_test.d.tar.gz") else {
-        return;
-    };
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "Conversion failed: {stderr}");
 
-    let (success, _, stderr) = run_conversion(&input);
-    assert!(success, "Conversion failed: {stderr}");
+    let mzml_path = output_dir
+        .path()
+        .join("230711_idleflow_400-1000mz_25mz_diaPasef_10sec.mzML");
+    assert!(mzml_path.exists(), "Output mzML not created");
+
+    let content = std::fs::read_to_string(&mzml_path).unwrap();
+    let spectra = content.matches("</spectrum>").count();
+    assert!(spectra > 100, "Expected >100 spectra, got {spectra}");
+    assert!(
+        content.contains("\"ms level\" value=\"1\""),
+        "No MS1 spectra"
+    );
+    assert!(
+        content.contains("\"ms level\" value=\"2\""),
+        "No MS2 spectra"
+    );
+    assert!(content.contains("<indexedmzML"), "Not indexed mzML");
+    assert!(
+        content.contains("isolation window target m/z"),
+        "No isolation windows"
+    );
 }
 
 #[test]
 fn test_thermo_raw_conversion() {
-    let input = Path::new("tests/data/test.raw");
+    let input = Path::new("tests/data/small.RAW");
     if !input.exists() {
         eprintln!("Skipping test: {} not found", input.display());
         return;
     }
 
-    // The test .raw file may be truncated/corrupt — just verify the binary
-    // runs without crashing (exit code != signal/access violation).
     let output_dir = tempfile::tempdir().unwrap();
     let result = mzdata_converter()
         .arg(input)
@@ -93,10 +138,19 @@ fn test_thermo_raw_conversion() {
         .expect("Failed to run mzdata-converter");
 
     let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "Conversion failed: {stderr}");
+
+    let mzml_path = output_dir.path().join("small.mzML");
+    assert!(mzml_path.exists(), "Output mzML not created");
+
+    let content = std::fs::read_to_string(&mzml_path).unwrap();
+    let spectra = content.matches("</spectrum>").count();
+    assert!(spectra > 0, "No spectra in output, got {spectra}");
     assert!(
-        result.status.code().is_some(),
-        "Process crashed (signal): {stderr}"
+        content.contains("\"ms level\" value=\"1\""),
+        "No MS1 spectra"
     );
+    assert!(content.contains("<indexedmzML"), "Not indexed mzML");
 }
 
 #[test]
@@ -112,8 +166,8 @@ fn test_missing_input_fails() {
 #[test]
 fn test_multiple_files() {
     let inputs: Vec<PathBuf> = [
-        ensure_extracted("tests/data/test.d.tar.gz"),
-        ensure_extracted("tests/data/dia_test.d.tar.gz"),
+        ensure_extracted("tests/data/200ngHeLaPASEF_1min.d.tar.gz"),
+        ensure_extracted("tests/data/230711_idleflow_400-1000mz_25mz_diaPasef_10sec.d.tar.gz"),
     ]
     .into_iter()
     .flatten()

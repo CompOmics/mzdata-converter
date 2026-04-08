@@ -1,0 +1,2 @@
+tests/data/*.tar.gz filter=lfs diff=lfs merge=lfs -text
+tests/data/*.RAW filter=lfs diff=lfs merge=lfs -text
