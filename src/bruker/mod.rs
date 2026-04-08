@@ -199,10 +199,8 @@ pub fn find_sdk_library() -> Option<std::path::PathBuf> {
         }
     }
 
-    // Fall back to system library paths (dlopen/LoadLibrary search)
-    if unsafe { libloading::Library::new(lib_name) }.is_ok() {
-        return Some(std::path::PathBuf::from(lib_name));
-    }
-
+    // Fall back to system library paths. Return the bare library name and let
+    // TimsDataHandle::open (via libloading) search system paths
+    // (LD_LIBRARY_PATH, /usr/local/lib, PATH, etc.)
     None
 }

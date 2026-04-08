@@ -393,7 +393,7 @@ fn convert_bruker_sdk(
     }
 
     writer.close()?;
-    Ok(total)
+    Ok(spectrum_index as u64)
 }
 
 /// Convert a single file from its source format to indexed mzML.
@@ -407,11 +407,21 @@ fn convert_file(
 ) -> Result<u64> {
     // Try Bruker native SDK for .d directories
     if is_bruker_dir(input) {
-        if let Some(sdk_path) = bruker::find_sdk_library() {
-            info!("Using Bruker native SDK: {}", sdk_path.display());
-            return convert_bruker_sdk(input, output, compression, pb, &sdk_path);
+        let sdk_path = bruker::find_sdk_library().unwrap_or_else(|| {
+            // Try bare library name — lets dlopen/LoadLibrary search system paths
+            let name = if cfg!(windows) {
+                "timsdata.dll"
+            } else {
+                "libtimsdata.so"
+            };
+            PathBuf::from(name)
+        });
+        match convert_bruker_sdk(input, output, compression, pb, &sdk_path) {
+            Ok(total) => return Ok(total),
+            Err(e) => {
+                info!("Bruker SDK not available ({e:#}), falling back to timsrust");
+            }
         }
-        info!("Bruker SDK not found, falling back to timsrust");
     }
 
     let mut reader = MZReader::open_path(input)
