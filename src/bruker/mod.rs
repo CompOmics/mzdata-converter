@@ -12,7 +12,8 @@ use rusqlite::Connection;
 #[derive(Debug, Clone)]
 pub struct FrameInfo {
     pub id: i64,
-    pub ms_level: u8,
+    /// MsMsType: 0=MS1, 8=DDA PASEF, 9=DIA PASEF
+    pub msms_type: i32,
     pub num_scans: u32,
     pub time: f64, // retention time in seconds
 }
@@ -32,6 +33,16 @@ pub struct PrecursorInfo {
     pub isolation_mz: Option<f64>,
     pub isolation_width: Option<f64>,
     pub collision_energy: Option<f64>,
+}
+
+/// DIA isolation window definition from DiaFrameMsMsWindows.
+#[derive(Debug, Clone)]
+pub struct DiaWindow {
+    pub scan_start: u32,
+    pub scan_end: u32,
+    pub mz_center: f64,
+    pub mz_width: f64,
+    pub collision_energy: f64,
 }
 
 /// Global metadata from the analysis.tdf GlobalMetadata table.
@@ -97,10 +108,9 @@ pub fn read_frames(tdf_path: &Path) -> Result<Vec<FrameInfo>> {
 
     let frames = stmt
         .query_map([], |row| {
-            let msms_type: i32 = row.get(1)?;
             Ok(FrameInfo {
                 id: row.get(0)?,
-                ms_level: if msms_type == 0 { 1 } else { 2 },
+                msms_type: row.get(1)?,
                 num_scans: row.get(2)?,
                 time: row.get(3)?,
             })
@@ -152,6 +162,80 @@ pub fn read_precursors(tdf_path: &Path) -> Result<Vec<PrecursorInfo>> {
     Ok(precursors)
 }
 
+/// Read DIA isolation window definitions, grouped by window group.
+pub fn read_dia_windows(tdf_path: &Path) -> Result<HashMap<i32, Vec<DiaWindow>>> {
+    let conn = Connection::open(tdf_path).with_context(|| "Failed to open analysis.tdf")?;
+
+    // Table may not exist in DDA-only files
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='DiaFrameMsMsWindows'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !table_exists {
+        return Ok(HashMap::new());
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT WindowGroup, ScanNumBegin, ScanNumEnd, IsolationMz, IsolationWidth, CollisionEnergy \
+             FROM DiaFrameMsMsWindows ORDER BY WindowGroup",
+        )
+        .with_context(|| "Failed to query DiaFrameMsMsWindows")?;
+
+    let mut windows: HashMap<i32, Vec<DiaWindow>> = HashMap::new();
+    stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i32>(0)?,
+            DiaWindow {
+                scan_start: row.get(1)?,
+                scan_end: row.get(2)?,
+                mz_center: row.get(3)?,
+                mz_width: row.get(4)?,
+                collision_energy: row.get(5)?,
+            },
+        ))
+    })?
+    .filter_map(|r| r.ok())
+    .for_each(|(group, window)| {
+        windows.entry(group).or_default().push(window);
+    });
+
+    Ok(windows)
+}
+
+/// Read DIA frame-to-window-group mapping.
+pub fn read_dia_frame_mapping(tdf_path: &Path) -> Result<HashMap<i64, i32>> {
+    let conn = Connection::open(tdf_path).with_context(|| "Failed to open analysis.tdf")?;
+
+    // Table may not exist in DDA-only files
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='DiaFrameMsMsInfo'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !table_exists {
+        return Ok(HashMap::new());
+    }
+
+    let mut stmt = conn
+        .prepare("SELECT Frame, WindowGroup FROM DiaFrameMsMsInfo")
+        .with_context(|| "Failed to query DiaFrameMsMsInfo")?;
+
+    let mapping = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(mapping)
+}
+
 /// Find the SDK library (timsdata.dll / libtimsdata.so).
 ///
 /// Search order:
@@ -159,7 +243,6 @@ pub fn read_precursors(tdf_path: &Path) -> Result<Vec<PrecursorInfo>> {
 /// 2. `libs/` next to the executable (for development)
 /// 3. Current working directory
 /// 4. `BRUKER_SDK_PATH` environment variable
-/// 5. System library paths (e.g. /usr/local/lib on Linux)
 pub fn find_sdk_library() -> Option<std::path::PathBuf> {
     let lib_name = if cfg!(windows) {
         "timsdata.dll"
@@ -199,8 +282,5 @@ pub fn find_sdk_library() -> Option<std::path::PathBuf> {
         }
     }
 
-    // Fall back to system library paths. Return the bare library name and let
-    // TimsDataHandle::open (via libloading) search system paths
-    // (LD_LIBRARY_PATH, /usr/local/lib, PATH, etc.)
     None
 }

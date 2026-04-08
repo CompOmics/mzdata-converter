@@ -241,6 +241,7 @@ fn build_spectrum(params: BrukerSpectrumParams) -> MultiLayerSpectrum {
 }
 
 /// Convert a Bruker .d directory using the native SDK for fast centroiding.
+/// Supports both DDA (MsMsType=8) and DIA (MsMsType=9) acquisition modes.
 fn convert_bruker_sdk(
     input: &Path,
     output: &Path,
@@ -251,13 +252,12 @@ fn convert_bruker_sdk(
     let tdf_path = input.join("analysis.tdf");
     let sdk = bruker::TimsDataHandle::open(sdk_path, input)?;
     let metadata = bruker::read_metadata(&tdf_path)?;
-    let ms1_frames: Vec<_> = bruker::read_frames(&tdf_path)?
-        .into_iter()
-        .filter(|f| f.ms_level == 1 && f.num_scans > 0)
-        .collect();
+    let frames = bruker::read_frames(&tdf_path)?;
     let precursors = bruker::read_precursors(&tdf_path)?;
+    let dia_windows = bruker::read_dia_windows(&tdf_path)?;
+    let dia_frame_mapping = bruker::read_dia_frame_mapping(&tdf_path)?;
 
-    // Group precursors by parent MS1 frame for interleaved output
+    // Group DDA precursors by parent MS1 frame
     let mut precursors_by_parent: std::collections::HashMap<i64, Vec<&bruker::PrecursorInfo>> =
         std::collections::HashMap::new();
     for p in &precursors {
@@ -267,7 +267,19 @@ fn convert_bruker_sdk(
             .push(p);
     }
 
-    let total = (ms1_frames.len() + precursors.len()) as u64;
+    // Estimate total spectra: MS1 + DDA precursors + DIA (frames × windows)
+    let ms1_count = frames
+        .iter()
+        .filter(|f| f.msms_type == 0 && f.num_scans > 0)
+        .count();
+    let dia_spectrum_count: usize = frames
+        .iter()
+        .filter(|f| f.msms_type == 9)
+        .filter_map(|f| dia_frame_mapping.get(&f.id))
+        .filter_map(|group| dia_windows.get(group))
+        .map(|windows| windows.len())
+        .sum();
+    let total = (ms1_count + precursors.len() + dia_spectrum_count) as u64;
     pb.set_length(total);
 
     let fh = BufWriter::with_capacity(
@@ -277,118 +289,196 @@ fn convert_bruker_sdk(
     );
     let mut writer = MzMLWriterType::new_with_index_and_compression(fh, true, compression);
 
-    // Populate file metadata
-    if let Ok(sf) = mzdata::meta::SourceFile::from_path(input.join("analysis.tdf")) {
-        writer.file_description.source_files.push(sf);
-    }
-    writer.softwares.push(mzdata::meta::Software {
-        id: "mzdata-converter".to_string(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        ..Default::default()
-    });
+    // Note: we don't populate source file or instrument metadata here because
+    // MzMLWriterType panics on empty InstrumentConfiguration components.
+    // The mzdata writer handles basic metadata automatically.
 
     writer.set_spectrum_count(total);
 
     let mz_range = Some((metadata.mz_acq_range_lower, metadata.mz_acq_range_upper));
     let mut spectrum_index: usize = 0;
+    let mut last_ms1_id = String::new();
 
-    for frame in &ms1_frames {
-        // MS1: extract centroided spectrum aggregated across all mobility scans
-        let (mzs, intensities) = match sdk.extract_centroided_spectrum(frame.id, 0, frame.num_scans)
-        {
-            Ok(result) => result,
-            Err(e) => {
-                log::warn!("Skipping MS1 frame {}: {e}", frame.id);
-                pb.inc(1);
-                continue;
-            }
-        };
+    for frame in &frames {
+        if frame.num_scans == 0 {
+            continue;
+        }
 
-        let ms1_id = format!(
-            "merged=0 frame={} scanStart=0 scanEnd={}",
-            frame.id, frame.num_scans
-        );
-        let spectrum = build_spectrum(BrukerSpectrumParams {
-            mzs: &mzs,
-            intensities: &intensities,
-            id: &ms1_id,
-            index: spectrum_index,
-            ms_level: 1,
-            time_minutes: frame.time / 60.0,
-            ion_mobility: None,
-            precursor: None,
-            mz_range,
-        });
-        spectrum_index += 1;
-        writer.write_owned(spectrum)?;
-        pb.inc(1);
+        match frame.msms_type {
+            // MS1: extract centroided spectrum across all mobility scans
+            0 => {
+                let (mzs, intensities) =
+                    match sdk.extract_centroided_spectrum(frame.id, 0, frame.num_scans) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            log::warn!("Skipping MS1 frame {}: {e}", frame.id);
+                            pb.inc(1);
+                            continue;
+                        }
+                    };
 
-        // Write MS2 spectra for precursors selected from this MS1 frame
-        if let Some(precs) = precursors_by_parent.get(&frame.id) {
-            let precursor_ids: Vec<i64> = precs.iter().map(|p| p.id).collect();
-            let msms_data = match sdk.read_pasef_msms(&precursor_ids) {
-                Ok(data) => data,
-                Err(e) => {
-                    log::warn!("Skipping MS2 precursors for frame {}: {e}", frame.id);
-                    pb.inc(precs.len() as u64);
-                    continue;
-                }
-            };
-
-            for p in precs {
-                let (mzs, intensities) = match msms_data.get(&p.id) {
-                    Some(data) => data,
-                    None => {
-                        pb.inc(1);
-                        continue;
-                    }
-                };
-
-                // Compute ion mobility (1/K0) from scan number
-                let ion_mobility = sdk.scannum_to_oneoverk0(p.parent_frame, p.scan_number).ok();
-
-                let mut precursor = mzdata::spectrum::Precursor {
-                    precursor_id: Some(ms1_id.clone()),
-                    ..Default::default()
-                };
-                let selected_mz = p.monoisotopic_mz.unwrap_or(p.largest_peak_mz);
-                precursor.ions.push(mzdata::spectrum::SelectedIon {
-                    mz: selected_mz,
-                    charge: p.charge,
-                    intensity: p.intensity as f32,
-                    ..Default::default()
-                });
-                if let (Some(iso_mz), Some(iso_width)) = (p.isolation_mz, p.isolation_width) {
-                    precursor.isolation_window.target = iso_mz as f32;
-                    let half = iso_width as f32 / 2.0;
-                    precursor.isolation_window.lower_bound = half;
-                    precursor.isolation_window.upper_bound = half;
-                    precursor.isolation_window.flags =
-                        mzdata::spectrum::IsolationWindowState::Offset;
-                }
-                if let Some(ce) = p.collision_energy {
-                    precursor.activation.energy = ce as f32;
-                    precursor
-                        .activation
-                        .methods_mut()
-                        .push(mzdata::meta::DissociationMethodTerm::CollisionInducedDissociation);
-                }
-
+                last_ms1_id = format!(
+                    "merged=0 frame={} scanStart=0 scanEnd={}",
+                    frame.id, frame.num_scans
+                );
                 let spectrum = build_spectrum(BrukerSpectrumParams {
-                    mzs,
-                    intensities,
-                    id: &format!("precursor={}", p.id),
+                    mzs: &mzs,
+                    intensities: &intensities,
+                    id: &last_ms1_id,
                     index: spectrum_index,
-                    ms_level: 2,
-                    time_minutes: p.retention_time / 60.0,
-                    ion_mobility,
-                    precursor: Some(precursor),
+                    ms_level: 1,
+                    time_minutes: frame.time / 60.0,
+                    ion_mobility: None,
+                    precursor: None,
                     mz_range,
                 });
                 spectrum_index += 1;
                 writer.write_owned(spectrum)?;
                 pb.inc(1);
+
+                // DDA: write child MS2 precursors for this MS1 frame
+                if let Some(precs) = precursors_by_parent.get(&frame.id) {
+                    let precursor_ids: Vec<i64> = precs.iter().map(|p| p.id).collect();
+                    let msms_data = match sdk.read_pasef_msms(&precursor_ids) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            log::warn!("Skipping MS2 precursors for frame {}: {e}", frame.id);
+                            pb.inc(precs.len() as u64);
+                            continue;
+                        }
+                    };
+
+                    for p in precs {
+                        let (mzs, intensities) = match msms_data.get(&p.id) {
+                            Some(data) => data,
+                            None => {
+                                pb.inc(1);
+                                continue;
+                            }
+                        };
+
+                        let ion_mobility =
+                            sdk.scannum_to_oneoverk0(p.parent_frame, p.scan_number).ok();
+
+                        let mut precursor = mzdata::spectrum::Precursor {
+                            precursor_id: Some(last_ms1_id.clone()),
+                            ..Default::default()
+                        };
+                        let selected_mz = p.monoisotopic_mz.unwrap_or(p.largest_peak_mz);
+                        precursor.ions.push(mzdata::spectrum::SelectedIon {
+                            mz: selected_mz,
+                            charge: p.charge,
+                            intensity: p.intensity as f32,
+                            ..Default::default()
+                        });
+                        if let (Some(iso_mz), Some(iso_width)) = (p.isolation_mz, p.isolation_width)
+                        {
+                            precursor.isolation_window.target = iso_mz as f32;
+                            let half = iso_width as f32 / 2.0;
+                            precursor.isolation_window.lower_bound = half;
+                            precursor.isolation_window.upper_bound = half;
+                            precursor.isolation_window.flags =
+                                mzdata::spectrum::IsolationWindowState::Offset;
+                        }
+                        if let Some(ce) = p.collision_energy {
+                            precursor.activation.energy = ce as f32;
+                            precursor.activation.methods_mut().push(
+                                mzdata::meta::DissociationMethodTerm::CollisionInducedDissociation,
+                            );
+                        }
+
+                        let spectrum = build_spectrum(BrukerSpectrumParams {
+                            mzs,
+                            intensities,
+                            id: &format!("precursor={}", p.id),
+                            index: spectrum_index,
+                            ms_level: 2,
+                            time_minutes: p.retention_time / 60.0,
+                            ion_mobility,
+                            precursor: Some(precursor),
+                            mz_range,
+                        });
+                        spectrum_index += 1;
+                        writer.write_owned(spectrum)?;
+                        pb.inc(1);
+                    }
+                }
             }
+
+            // DIA: extract one spectrum per isolation window within the frame
+            9 => {
+                let window_group = match dia_frame_mapping.get(&frame.id) {
+                    Some(&group) => group,
+                    None => {
+                        log::warn!("No window group for DIA frame {}", frame.id);
+                        continue;
+                    }
+                };
+                let windows = match dia_windows.get(&window_group) {
+                    Some(w) => w,
+                    None => {
+                        log::warn!("No windows for group {window_group} in frame {}", frame.id);
+                        continue;
+                    }
+                };
+
+                for window in windows {
+                    let (mzs, intensities) = match sdk.extract_centroided_spectrum(
+                        frame.id,
+                        window.scan_start,
+                        window.scan_end,
+                    ) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            log::warn!("Skipping DIA window in frame {}: {e}", frame.id);
+                            pb.inc(1);
+                            continue;
+                        }
+                    };
+
+                    let mut precursor = mzdata::spectrum::Precursor {
+                        precursor_id: if last_ms1_id.is_empty() {
+                            None
+                        } else {
+                            Some(last_ms1_id.clone())
+                        },
+                        ..Default::default()
+                    };
+                    precursor.isolation_window.target = window.mz_center as f32;
+                    let half = window.mz_width as f32 / 2.0;
+                    precursor.isolation_window.lower_bound = half;
+                    precursor.isolation_window.upper_bound = half;
+                    precursor.isolation_window.flags =
+                        mzdata::spectrum::IsolationWindowState::Offset;
+                    precursor.activation.energy = window.collision_energy as f32;
+                    precursor
+                        .activation
+                        .methods_mut()
+                        .push(mzdata::meta::DissociationMethodTerm::CollisionInducedDissociation);
+
+                    let spectrum = build_spectrum(BrukerSpectrumParams {
+                        mzs: &mzs,
+                        intensities: &intensities,
+                        id: &format!(
+                            "merged=0 frame={} scanStart={} scanEnd={}",
+                            frame.id, window.scan_start, window.scan_end
+                        ),
+                        index: spectrum_index,
+                        ms_level: 2,
+                        time_minutes: frame.time / 60.0,
+                        ion_mobility: None,
+                        precursor: Some(precursor),
+                        mz_range,
+                    });
+                    spectrum_index += 1;
+                    writer.write_owned(spectrum)?;
+                    pb.inc(1);
+                }
+            }
+
+            // DDA MS2 frames (type 8) — handled above after their parent MS1
+            // Other frame types — skip
+            _ => {}
         }
     }
 
@@ -441,6 +531,14 @@ fn convert_file(
     );
     let mut writer = MzMLWriterType::new_with_index_and_compression(fh, true, compression);
     writer.copy_metadata_from(&reader);
+    // Remove instrument configurations with unknown components that cause the writer to panic
+    for ic in writer.instrument_configurations.values_mut() {
+        ic.components
+            .retain(|c| c.component_type != mzdata::meta::ComponentType::Unknown);
+    }
+    writer
+        .instrument_configurations
+        .retain(|_, ic| !ic.components.is_empty());
     writer.set_spectrum_count(total);
 
     {
