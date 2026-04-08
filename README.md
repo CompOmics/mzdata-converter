@@ -11,7 +11,14 @@ Bruker and Thermo raw file to mzML converter built with [mzdata](https://github.
 
 ## Installation
 
-Download a binary from the [releases](https://github.com/ralfg/mzdata-converter/releases) page.
+Download a binary from the [releases](https://github.com/compomics/mzdata-converter/releases) page.
+
+Or use Docker:
+
+```bash
+docker pull ghcr.io/compomics/mzdata-converter:latest
+docker run -v $(pwd):/data -w /data ghcr.io/compomics/mzdata-converter sample.RAW
+```
 
 ## Usage
 
