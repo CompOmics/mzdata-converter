@@ -4,10 +4,12 @@ Bruker and Thermo raw file to mzML converter built with [mzdata](https://github.
 
 ## Supported Formats
 
-- Thermo RAW
-- Bruker TDF
+- Thermo RAW (.NET 8 runtime required)
+- Bruker TDF (DDA & DIA)
 - mzML
 - MGF
+
+**Platforms:** Windows and Linux (limited by vendor libraries). macOS users can use Docker.
 
 ## Installation
 
