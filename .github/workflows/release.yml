@@ -44,8 +44,20 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (Unix)
-        if: matrix.archive == 'tar.gz'
+      - name: Package (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../mzdata-converter-${{ matrix.target }}.tar.gz mzdata-converter
+          cd ../../..
+          # Also bundle with Bruker SDK
+          cp libs/libtimsdata.so target/${{ matrix.target }}/release/
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../mzdata-converter-${{ matrix.target }}-with-bruker-sdk.tar.gz mzdata-converter libtimsdata.so
+          cd ../../..
+
+      - name: Package (macOS)
+        if: contains(matrix.target, 'apple')
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../mzdata-converter-${{ matrix.target }}.tar.gz mzdata-converter
@@ -55,7 +67,7 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/mzdata-converter.exe -DestinationPath mzdata-converter-${{ matrix.target }}.zip
+          Compress-Archive -Path target/${{ matrix.target }}/release/mzdata-converter.exe,libs/timsdata.dll -DestinationPath mzdata-converter-${{ matrix.target }}.zip
 
       - uses: actions/upload-artifact@v4
         with:

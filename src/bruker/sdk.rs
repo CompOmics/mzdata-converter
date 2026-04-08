@@ -24,6 +24,7 @@ pub struct TimsDataHandle {
         unsafe extern "C" fn(u64, i64, u32, u32, SdkCallback, *mut std::ffi::c_void) -> u32,
     read_pasef_msms_fn:
         unsafe extern "C" fn(u64, *const i64, u32, SdkCallback, *mut std::ffi::c_void) -> u32,
+    scannum_to_ook0_fn: unsafe extern "C" fn(u64, i64, *const f64, *mut f64, u32) -> u32,
 }
 
 // SDK calls are not thread-safe per handle, but we use one handle per file/thread.
@@ -63,6 +64,11 @@ impl TimsDataHandle {
         let read_pasef_msms_fn = *unsafe { lib.get::<PasefFn>(b"tims_read_pasef_msms_v2\0") }
             .with_context(|| "Failed to find tims_read_pasef_msms_v2")?;
 
+        type ConvertFn = unsafe extern "C" fn(u64, i64, *const f64, *mut f64, u32) -> u32;
+
+        let scannum_to_ook0_fn = *unsafe { lib.get::<ConvertFn>(b"tims_scannum_to_oneoverk0\0") }
+            .with_context(|| "Failed to find tims_scannum_to_oneoverk0")?;
+
         let error_fn: Symbol<unsafe extern "C" fn(*mut i8, u32) -> u32> =
             unsafe { lib.get(b"tims_get_last_error_string\0") }
                 .with_context(|| "Failed to find tims_get_last_error_string")?;
@@ -89,6 +95,7 @@ impl TimsDataHandle {
             handle,
             extract_centroid_fn,
             read_pasef_msms_fn,
+            scannum_to_ook0_fn,
         })
     }
 
@@ -183,6 +190,25 @@ impl TimsDataHandle {
         }
 
         Ok(data.spectra)
+    }
+
+    /// Convert a scan number to 1/K0 value for a given frame.
+    pub fn scannum_to_oneoverk0(&self, frame_id: i64, scan_number: f64) -> Result<f64> {
+        let input = [scan_number];
+        let mut output = [0.0f64];
+        let ret = unsafe {
+            (self.scannum_to_ook0_fn)(
+                self.handle,
+                frame_id,
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                1,
+            )
+        };
+        if ret == 0 {
+            bail!("SDK scannum_to_oneoverk0 failed for frame {frame_id}");
+        }
+        Ok(output[0])
     }
 }
 

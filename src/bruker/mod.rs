@@ -2,6 +2,7 @@ mod sdk;
 
 pub use sdk::TimsDataHandle;
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -23,6 +24,7 @@ pub struct PrecursorInfo {
     pub id: i64,
     pub largest_peak_mz: f64,
     pub monoisotopic_mz: Option<f64>,
+    pub scan_number: f64,
     pub charge: Option<i32>,
     pub intensity: f64,
     pub parent_frame: i64,
@@ -30,6 +32,56 @@ pub struct PrecursorInfo {
     pub isolation_mz: Option<f64>,
     pub isolation_width: Option<f64>,
     pub collision_energy: Option<f64>,
+}
+
+/// Global metadata from the analysis.tdf GlobalMetadata table.
+#[derive(Debug, Clone)]
+pub struct TdfMetadata {
+    #[allow(dead_code)]
+    pub acquisition_software: String,
+    #[allow(dead_code)]
+    pub acquisition_software_version: String,
+    #[allow(dead_code)]
+    pub instrument_serial_number: String,
+    pub mz_acq_range_lower: f64,
+    pub mz_acq_range_upper: f64,
+    #[allow(dead_code)]
+    pub ook0_acq_range_lower: f64,
+    #[allow(dead_code)]
+    pub ook0_acq_range_upper: f64,
+    #[allow(dead_code)]
+    pub instrument_name: String,
+    #[allow(dead_code)]
+    pub sample_name: String,
+}
+
+/// Read global metadata from analysis.tdf.
+pub fn read_metadata(tdf_path: &Path) -> Result<TdfMetadata> {
+    let conn = Connection::open(tdf_path).with_context(|| "Failed to open analysis.tdf")?;
+
+    let mut stmt = conn
+        .prepare("SELECT Key, Value FROM GlobalMetadata")
+        .with_context(|| "Failed to query GlobalMetadata")?;
+
+    let kv: HashMap<String, String> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let get = |key: &str| kv.get(key).cloned().unwrap_or_default();
+    let get_f64 = |key: &str| get(key).parse::<f64>().unwrap_or(0.0);
+
+    Ok(TdfMetadata {
+        acquisition_software: get("AcquisitionSoftware"),
+        acquisition_software_version: get("AcquisitionSoftwareVersion"),
+        instrument_serial_number: get("InstrumentSerialNumber"),
+        mz_acq_range_lower: get_f64("MzAcqRangeLower"),
+        mz_acq_range_upper: get_f64("MzAcqRangeUpper"),
+        ook0_acq_range_lower: get_f64("OneOverK0AcqRangeLower"),
+        ook0_acq_range_upper: get_f64("OneOverK0AcqRangeUpper"),
+        instrument_name: get("InstrumentName"),
+        sample_name: get("SampleName"),
+    })
 }
 
 /// Read all frame metadata from analysis.tdf.
@@ -67,8 +119,8 @@ pub fn read_precursors(tdf_path: &Path) -> Result<Vec<PrecursorInfo>> {
     // (all PASEF frames for the same precursor share the same isolation parameters).
     let mut stmt = conn
         .prepare(
-            "SELECT p.Id, p.LargestPeakMz, p.MonoisotopicMz, p.Charge, p.Intensity, \
-                    p.Parent, fr.Time, \
+            "SELECT p.Id, p.LargestPeakMz, p.MonoisotopicMz, p.ScanNumber, \
+                    p.Charge, p.Intensity, p.Parent, fr.Time, \
                     MIN(f.IsolationMz), MIN(f.IsolationWidth), MIN(f.CollisionEnergy) \
              FROM Precursors p \
              LEFT JOIN PasefFrameMsMsInfo f ON f.Precursor = p.Id \
@@ -84,13 +136,14 @@ pub fn read_precursors(tdf_path: &Path) -> Result<Vec<PrecursorInfo>> {
                 id: row.get(0)?,
                 largest_peak_mz: row.get(1)?,
                 monoisotopic_mz: row.get(2)?,
-                charge: row.get(3)?,
-                intensity: row.get(4)?,
-                parent_frame: row.get(5)?,
-                retention_time: row.get(6)?,
-                isolation_mz: row.get(7)?,
-                isolation_width: row.get(8)?,
-                collision_energy: row.get(9)?,
+                scan_number: row.get(3)?,
+                charge: row.get(4)?,
+                intensity: row.get(5)?,
+                parent_frame: row.get(6)?,
+                retention_time: row.get(7)?,
+                isolation_mz: row.get(8)?,
+                isolation_width: row.get(9)?,
+                collision_energy: row.get(10)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
@@ -106,6 +159,7 @@ pub fn read_precursors(tdf_path: &Path) -> Result<Vec<PrecursorInfo>> {
 /// 2. `libs/` next to the executable (for development)
 /// 3. Current working directory
 /// 4. `BRUKER_SDK_PATH` environment variable
+/// 5. System library paths (e.g. /usr/local/lib on Linux)
 pub fn find_sdk_library() -> Option<std::path::PathBuf> {
     let lib_name = if cfg!(windows) {
         "timsdata.dll"
@@ -143,6 +197,11 @@ pub fn find_sdk_library() -> Option<std::path::PathBuf> {
         if sdk_path.exists() {
             return Some(sdk_path);
         }
+    }
+
+    // Fall back to system library paths (dlopen/LoadLibrary search)
+    if unsafe { libloading::Library::new(lib_name) }.is_ok() {
+        return Some(std::path::PathBuf::from(lib_name));
     }
 
     None

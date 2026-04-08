@@ -19,5 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/mzdata-converter /usr/local/bin/
+COPY libs/libtimsdata.so /usr/local/lib/
+RUN ldconfig
 
 ENTRYPOINT ["mzdata-converter"]

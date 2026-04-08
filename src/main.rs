@@ -118,20 +118,43 @@ fn is_bruker_dir(path: &Path) -> bool {
         && path.join("analysis.tdf").exists()
 }
 
-/// Build a MultiLayerSpectrum from raw m/z and intensity arrays.
-fn build_spectrum(
-    mzs: &[f64],
-    intensities: &[f32],
-    id: &str,
+/// Parameters for building a spectrum in the Bruker SDK path.
+struct BrukerSpectrumParams<'a> {
+    mzs: &'a [f64],
+    intensities: &'a [f32],
+    id: &'a str,
     index: usize,
     ms_level: u8,
-    time_seconds: f64,
+    time_minutes: f64,
+    ion_mobility: Option<f64>,
     precursor: Option<mzdata::spectrum::Precursor>,
-) -> MultiLayerSpectrum {
+    mz_range: Option<(f64, f64)>,
+}
+
+/// Build a CV param with accession, name, value, and unit.
+fn cv_param(
+    accession: u32,
+    name: &str,
+    value: impl ToString,
+    unit: mzdata::params::Unit,
+) -> mzdata::params::Param {
+    let mut p = mzdata::params::Param::new_key_value(name, value.to_string());
+    p.accession = Some(accession);
+    p.controlled_vocabulary = Some(mzdata::params::ControlledVocabulary::MS);
+    p.unit = unit;
+    p
+}
+
+/// Build a MultiLayerSpectrum from raw m/z and intensity arrays.
+fn build_spectrum(params: BrukerSpectrumParams) -> MultiLayerSpectrum {
     use mzdata::spectrum::bindata::{ArrayType, BinaryDataArrayType, DataArray as BinDataArray};
 
-    let mz_bytes: Vec<u8> = mzs.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let int_bytes: Vec<u8> = intensities.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mz_bytes: Vec<u8> = params.mzs.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let int_bytes: Vec<u8> = params
+        .intensities
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
 
     let mut arrays = mzdata::spectrum::bindata::BinaryArrayMap::new();
     arrays.add(BinDataArray::wrap(
@@ -145,19 +168,73 @@ fn build_spectrum(
         int_bytes,
     ));
 
+    // Compute TIC and base peak from arrays
+    let tic: f64 = params.intensities.iter().map(|&v| v as f64).sum();
+    let (bp_mz, bp_intensity) = if let Some(max_idx) = params
+        .intensities
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+    {
+        (params.mzs[max_idx], params.intensities[max_idx] as f64)
+    } else {
+        (0.0, 0.0)
+    };
+
     let mut spectrum: MultiLayerSpectrum = MultiLayerSpectrum::default();
-    spectrum.description.id = id.to_string();
-    spectrum.description.index = index;
-    spectrum.description.ms_level = ms_level;
+    spectrum.description.id = params.id.to_string();
+    spectrum.description.index = params.index;
+    spectrum.description.ms_level = params.ms_level;
     spectrum.description.signal_continuity = mzdata::spectrum::SignalContinuity::Centroid;
+
+    // TIC and base peak as params
+    use mzdata::params::Unit;
+    spectrum.description.params.push(cv_param(
+        1000285,
+        "total ion current",
+        tic,
+        Unit::DetectorCounts,
+    ));
     spectrum
         .description
-        .acquisition
-        .scans
-        .push(mzdata::spectrum::ScanEvent::default());
-    spectrum.description.acquisition.scans[0].start_time = time_seconds / 60.0;
+        .params
+        .push(cv_param(1000504, "base peak m/z", bp_mz, Unit::MZ));
+    spectrum.description.params.push(cv_param(
+        1000505,
+        "base peak intensity",
+        bp_intensity,
+        Unit::DetectorCounts,
+    ));
+
+    // Scan event with retention time, ion mobility, scan windows
+    let mut scan = mzdata::spectrum::ScanEvent {
+        start_time: params.time_minutes,
+        ..Default::default()
+    };
+    if let Some(ook0) = params.ion_mobility {
+        let param = cv_param(
+            1002815,
+            "inverse reduced ion mobility",
+            ook0,
+            Unit::VoltSecondPerSquareCentimeter,
+        );
+        let params_list = scan.params.get_or_insert_with(|| Box::new(Vec::new()));
+        params_list.push(param);
+    }
+    if let Some((mz_low, mz_high)) = params.mz_range {
+        scan.scan_windows.push(mzdata::spectrum::ScanWindow::new(
+            mz_low as f32,
+            mz_high as f32,
+        ));
+    }
+
+    // Sum of spectra (mobility scans are aggregated)
+    spectrum.description.acquisition.combination = mzdata::spectrum::ScanCombination::Sum;
+    spectrum.description.acquisition.scans.push(scan);
+
     spectrum.arrays = Some(arrays);
-    if let Some(p) = precursor {
+    if let Some(p) = params.precursor {
         spectrum.description.precursor.push(p);
     }
     spectrum
@@ -173,6 +250,7 @@ fn convert_bruker_sdk(
 ) -> Result<u64> {
     let tdf_path = input.join("analysis.tdf");
     let sdk = bruker::TimsDataHandle::open(sdk_path, input)?;
+    let metadata = bruker::read_metadata(&tdf_path)?;
     let ms1_frames: Vec<_> = bruker::read_frames(&tdf_path)?
         .into_iter()
         .filter(|f| f.ms_level == 1 && f.num_scans > 0)
@@ -198,31 +276,49 @@ fn convert_bruker_sdk(
             .with_context(|| format!("Failed to create: {}", output.display()))?,
     );
     let mut writer = MzMLWriterType::new_with_index_and_compression(fh, true, compression);
+
+    // Populate file metadata
+    if let Ok(sf) = mzdata::meta::SourceFile::from_path(input.join("analysis.tdf")) {
+        writer.file_description.source_files.push(sf);
+    }
+    writer.softwares.push(mzdata::meta::Software {
+        id: "mzdata-converter".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        ..Default::default()
+    });
+
     writer.set_spectrum_count(total);
 
+    let mz_range = Some((metadata.mz_acq_range_lower, metadata.mz_acq_range_upper));
     let mut spectrum_index: usize = 0;
 
     for frame in &ms1_frames {
         // MS1: extract centroided spectrum aggregated across all mobility scans
-        let (mzs, intensities) =
-            match sdk.extract_centroided_spectrum(frame.id, 0, frame.num_scans) {
-                Ok(result) => result,
-                Err(e) => {
-                    log::warn!("Skipping MS1 frame {}: {e}", frame.id);
-                    pb.inc(1);
-                    continue;
-                }
-            };
+        let (mzs, intensities) = match sdk.extract_centroided_spectrum(frame.id, 0, frame.num_scans)
+        {
+            Ok(result) => result,
+            Err(e) => {
+                log::warn!("Skipping MS1 frame {}: {e}", frame.id);
+                pb.inc(1);
+                continue;
+            }
+        };
 
-        let spectrum = build_spectrum(
-            &mzs,
-            &intensities,
-            &format!("frame={}", frame.id),
-            spectrum_index,
-            1,
-            frame.time,
-            None,
+        let ms1_id = format!(
+            "merged=0 frame={} scanStart=0 scanEnd={}",
+            frame.id, frame.num_scans
         );
+        let spectrum = build_spectrum(BrukerSpectrumParams {
+            mzs: &mzs,
+            intensities: &intensities,
+            id: &ms1_id,
+            index: spectrum_index,
+            ms_level: 1,
+            time_minutes: frame.time / 60.0,
+            ion_mobility: None,
+            precursor: None,
+            mz_range,
+        });
         spectrum_index += 1;
         writer.write_owned(spectrum)?;
         pb.inc(1);
@@ -248,7 +344,13 @@ fn convert_bruker_sdk(
                     }
                 };
 
-                let mut precursor = mzdata::spectrum::Precursor::default();
+                // Compute ion mobility (1/K0) from scan number
+                let ion_mobility = sdk.scannum_to_oneoverk0(p.parent_frame, p.scan_number).ok();
+
+                let mut precursor = mzdata::spectrum::Precursor {
+                    precursor_id: Some(ms1_id.clone()),
+                    ..Default::default()
+                };
                 let selected_mz = p.monoisotopic_mz.unwrap_or(p.largest_peak_mz);
                 precursor.ions.push(mzdata::spectrum::SelectedIon {
                     mz: selected_mz,
@@ -261,20 +363,28 @@ fn convert_bruker_sdk(
                     let half = iso_width as f32 / 2.0;
                     precursor.isolation_window.lower_bound = half;
                     precursor.isolation_window.upper_bound = half;
+                    precursor.isolation_window.flags =
+                        mzdata::spectrum::IsolationWindowState::Offset;
                 }
                 if let Some(ce) = p.collision_energy {
                     precursor.activation.energy = ce as f32;
+                    precursor
+                        .activation
+                        .methods_mut()
+                        .push(mzdata::meta::DissociationMethodTerm::CollisionInducedDissociation);
                 }
 
-                let spectrum = build_spectrum(
+                let spectrum = build_spectrum(BrukerSpectrumParams {
                     mzs,
                     intensities,
-                    &format!("precursor={}", p.id),
-                    spectrum_index,
-                    2,
-                    p.retention_time,
-                    Some(precursor),
-                );
+                    id: &format!("precursor={}", p.id),
+                    index: spectrum_index,
+                    ms_level: 2,
+                    time_minutes: p.retention_time / 60.0,
+                    ion_mobility,
+                    precursor: Some(precursor),
+                    mz_range,
+                });
                 spectrum_index += 1;
                 writer.write_owned(spectrum)?;
                 pb.inc(1);
