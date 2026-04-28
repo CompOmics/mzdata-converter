@@ -20,6 +20,7 @@ use mzdata::prelude::*;
 use mzdata::spectrum::MultiLayerSpectrum;
 use mzdata::spectrum::bindata::BinaryCompressionType;
 use rayon::prelude::*;
+use timsrust::converters::ConvertableDomain;
 
 const BATCH_SIZE: usize = 128;
 const WRITER_BUF_SIZE: usize = 1024 * 1024;
@@ -56,6 +57,10 @@ struct Cli {
     /// Disable zlib compression of binary data arrays
     #[arg(long)]
     no_compression: bool,
+
+    /// Skip the Bruker native SDK and use the timsrust fallback instead
+    #[arg(long)]
+    no_sdk: bool,
 }
 
 /// Expand glob patterns and collect unique file paths.
@@ -486,6 +491,222 @@ fn convert_bruker_sdk(
     Ok(spectrum_index as u64)
 }
 
+/// Sort TOF indices and sum intensities at the same TOF bin (equivalent to timsrust group_and_sum).
+fn tof_group_and_sum(tof: Vec<u32>, intensities: Vec<u64>) -> (Vec<u32>, Vec<u64>) {
+    if tof.is_empty() {
+        return (tof, intensities);
+    }
+    let mut order: Vec<usize> = (0..tof.len()).collect();
+    order.sort_unstable_by_key(|&i| tof[i]);
+    let mut out_tof = Vec::with_capacity(tof.len());
+    let mut out_int = Vec::with_capacity(intensities.len());
+    let mut cur_tof = tof[order[0]];
+    let mut cur_int = intensities[order[0]];
+    for &idx in &order[1..] {
+        if tof[idx] == cur_tof {
+            cur_int += intensities[idx];
+        } else {
+            out_tof.push(cur_tof);
+            out_int.push(cur_int);
+            cur_tof = tof[idx];
+            cur_int = intensities[idx];
+        }
+    }
+    out_tof.push(cur_tof);
+    out_int.push(cur_int);
+    (out_tof, out_int)
+}
+
+/// Sliding-window smooth then local-maxima centroid on sorted TOF arrays.
+/// Matches timsrust's RawSpectrum::smooth + centroid internals exactly.
+fn tof_smooth_and_centroid(tof: &[u32], intensities: &[u64], window: u32) -> (Vec<u32>, Vec<u64>) {
+    let n = tof.len();
+    let mut smoothed = intensities.to_vec();
+    for (i, &t_i) in tof.iter().enumerate() {
+        let cur = intensities[i];
+        for j in i + 1..n {
+            if tof[j] - t_i > window {
+                break;
+            }
+            smoothed[i] += intensities[j];
+            smoothed[j] += cur;
+        }
+    }
+    let mut is_max = vec![true; n];
+    for (i, &t_i) in tof.iter().enumerate() {
+        for j in i + 1..n {
+            if tof[j] - t_i > window {
+                break;
+            }
+            if smoothed[i] < smoothed[j] {
+                is_max[i] = false;
+            } else {
+                is_max[j] = false;
+            }
+        }
+    }
+    let out_tof: Vec<u32> = tof.iter().zip(is_max.iter()).filter(|(_, m)| **m).map(|(&t, _)| t).collect();
+    let out_int: Vec<u64> = smoothed.iter().zip(is_max.iter()).filter(|(_, m)| **m).map(|(&v, _)| v).collect();
+    (out_tof, out_int)
+}
+
+/// Convert a Bruker .d directory using timsrust directly, bypassing both the Bruker SDK and
+/// mzdata's TDF reader. Uses timsrust's built-in scan summing + centroiding for MS2, and
+/// equivalent logic for MS1 frames.
+fn convert_timsrust_direct(
+    input: &Path,
+    output: &Path,
+    compression: BinaryCompressionType,
+    pb: &ProgressBar,
+) -> Result<u64> {
+    use timsrust::{
+        MSLevel,
+        readers::{FrameReader, MetadataReader, SpectrumReader},
+    };
+
+    let metadata = MetadataReader::new(input.join("analysis.tdf"))
+        .map_err(|e| anyhow::anyhow!("timsrust metadata: {e}"))?;
+    let mz_converter = metadata.mz_converter;
+
+    let frame_reader = FrameReader::new(input)
+        .map_err(|e| anyhow::anyhow!("timsrust frame reader: {e}"))?;
+
+    let spectrum_reader = SpectrumReader::new(input)
+        .map_err(|e| anyhow::anyhow!("timsrust spectrum reader: {e}"))?;
+
+    // Pre-load all MS2 spectra grouped by parent MS1 frame index (1-based SQL ID).
+    let mut ms2_by_parent: std::collections::HashMap<usize, Vec<timsrust::Spectrum>> =
+        std::collections::HashMap::new();
+    let loaded: Vec<Option<timsrust::Spectrum>> = (0..spectrum_reader.len())
+        .into_par_iter()
+        .map(|i| match spectrum_reader.get(i) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                if !e.to_string().contains("Decompression") {
+                    log::warn!("timsrust MS2 read error at {i}: {e}");
+                }
+                None
+            }
+        })
+        .collect();
+    for spectrum in loaded.into_iter().flatten() {
+        if let Some(ref prec) = spectrum.precursor {
+            ms2_by_parent.entry(prec.frame_index).or_default().push(spectrum);
+        }
+    }
+
+    let n_ms2: usize = ms2_by_parent.values().map(|v| v.len()).sum();
+    // Total is n_ms2 + MS1 count; MS1 count not cheaply available from 0.4.1 API,
+    // so leave length unset — progress bar shows elapsed count only.
+    let _ = n_ms2;
+
+    let fh = BufWriter::with_capacity(
+        WRITER_BUF_SIZE,
+        fs::File::create(output)
+            .with_context(|| format!("Failed to create: {}", output.display()))?,
+    );
+    let mut writer = MzMLWriterType::new_with_index_and_compression(fh, true, compression);
+
+    let mut spectrum_index: usize = 0;
+    let mut last_ms1_id = String::new();
+
+    for frame_pos in 0..frame_reader.len() {
+        let frame = match frame_reader.get(frame_pos) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("timsrust frame error at {frame_pos}: {e}");
+                continue;
+            }
+        };
+
+        if frame.ms_level != MSLevel::MS1 || frame.tof_indices.is_empty() {
+            continue;
+        }
+
+        let (summed_tof, summed_int) = tof_group_and_sum(
+            frame.tof_indices.clone(),
+            frame.intensities.iter().map(|&x| x as u64).collect(),
+        );
+        let (cent_tof, cent_int) = tof_smooth_and_centroid(&summed_tof, &summed_int, 1);
+
+        let mzs: Vec<f64> = cent_tof.iter().map(|&t| mz_converter.convert(t)).collect();
+        let ints: Vec<f32> = cent_int.iter().map(|&i| i as f32).collect();
+
+        let ms1_id = format!(
+            "merged=0 frame={} scanStart=0 scanEnd={}",
+            frame.index,
+            frame.scan_offsets.len()
+        );
+        last_ms1_id = ms1_id.clone();
+
+        let spectrum = build_spectrum(BrukerSpectrumParams {
+            mzs: &mzs,
+            intensities: &ints,
+            id: &ms1_id,
+            index: spectrum_index,
+            ms_level: 1,
+            time_minutes: frame.rt / 60.0,
+            ion_mobility: None,
+            precursor: None,
+            mz_range: None,
+        });
+        spectrum_index += 1;
+        writer.write_owned(spectrum)?;
+        pb.inc(1);
+
+        if let Some(ms2_spectra) = ms2_by_parent.get(&frame.index) {
+            for ms2 in ms2_spectra {
+                let ms2_mzs: Vec<f64> = ms2.mz_values.clone();
+                let ms2_ints: Vec<f32> = ms2.intensities.iter().map(|&i| i as f32).collect();
+
+                let mut precursor = mzdata::spectrum::Precursor {
+                    precursor_id: Some(last_ms1_id.clone()),
+                    ..Default::default()
+                };
+                if let Some(ref p) = ms2.precursor {
+                    precursor.ions.push(mzdata::spectrum::SelectedIon {
+                        mz: p.mz,
+                        charge: p.charge.map(|c| c as i32),
+                        intensity: p.intensity.unwrap_or(0.0) as f32,
+                        ..Default::default()
+                    });
+                }
+                precursor.isolation_window.target = ms2.isolation_mz as f32;
+                let half = ms2.isolation_width as f32 / 2.0;
+                precursor.isolation_window.lower_bound = half;
+                precursor.isolation_window.upper_bound = half;
+                precursor.isolation_window.flags = mzdata::spectrum::IsolationWindowState::Offset;
+                precursor.activation.energy = ms2.collision_energy as f32;
+                precursor
+                    .activation
+                    .methods_mut()
+                    .push(mzdata::meta::DissociationMethodTerm::CollisionInducedDissociation);
+
+                let rt = ms2.precursor.map(|p| p.rt / 60.0).unwrap_or(frame.rt / 60.0);
+                let im = ms2.precursor.map(|p| p.im);
+
+                let spectrum = build_spectrum(BrukerSpectrumParams {
+                    mzs: &ms2_mzs,
+                    intensities: &ms2_ints,
+                    id: &format!("precursor={}", ms2.index + 1),
+                    index: spectrum_index,
+                    ms_level: 2,
+                    time_minutes: rt,
+                    ion_mobility: im,
+                    precursor: Some(precursor),
+                    mz_range: None,
+                });
+                spectrum_index += 1;
+                writer.write_owned(spectrum)?;
+                pb.inc(1);
+            }
+        }
+    }
+
+    writer.close()?;
+    Ok(spectrum_index as u64)
+}
+
 /// Convert a single file from its source format to indexed mzML.
 fn convert_file(
     input: &Path,
@@ -493,25 +714,29 @@ fn convert_file(
     do_peak_picking: bool,
     sn_threshold: f32,
     compression: BinaryCompressionType,
+    use_sdk: bool,
     pb: &ProgressBar,
 ) -> Result<u64> {
-    // Try Bruker native SDK for .d directories
+    // Bruker .d: try SDK first, fall back to timsrust direct
     if is_bruker_dir(input) {
-        let sdk_path = bruker::find_sdk_library().unwrap_or_else(|| {
-            // Try bare library name — lets dlopen/LoadLibrary search system paths
-            let name = if cfg!(windows) {
-                "timsdata.dll"
-            } else {
-                "libtimsdata.so"
-            };
-            PathBuf::from(name)
-        });
-        match convert_bruker_sdk(input, output, compression, pb, &sdk_path) {
-            Ok(total) => return Ok(total),
-            Err(e) => {
-                info!("Bruker SDK not available ({e:#}), falling back to timsrust");
+        if use_sdk {
+            let sdk_path = bruker::find_sdk_library().unwrap_or_else(|| {
+                // Try bare library name — lets dlopen/LoadLibrary search system paths
+                let name = if cfg!(windows) {
+                    "timsdata.dll"
+                } else {
+                    "libtimsdata.so"
+                };
+                PathBuf::from(name)
+            });
+            match convert_bruker_sdk(input, output, compression, pb, &sdk_path) {
+                Ok(total) => return Ok(total),
+                Err(e) => {
+                    info!("Bruker SDK not available ({e:#}), falling back to timsrust direct");
+                }
             }
         }
+        return convert_timsrust_direct(input, output, compression, pb);
     }
 
     let mut reader = MZReader::open_path(input)
@@ -621,6 +846,7 @@ fn main() -> Result<()> {
     let jobs = cli.jobs.unwrap_or(num_files).max(1);
     let do_peak_picking = !cli.no_peak_picking;
     let sn_threshold = cli.sn_threshold;
+    let use_sdk = !cli.no_sdk;
     let output_dir = &cli.output_dir;
 
     let start = Instant::now();
@@ -668,6 +894,7 @@ fn main() -> Result<()> {
                     do_peak_picking,
                     sn_threshold,
                     compression,
+                    use_sdk,
                     &pb,
                 )?;
 

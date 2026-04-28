@@ -17,6 +17,7 @@ rayon = "1"
 mimalloc = "0.1"
 libloading = "0.8"
 rusqlite = "0.31"
+timsrust = { version = "0.4", features = ["tdf"] }
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
