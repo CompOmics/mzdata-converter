@@ -6,14 +6,23 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 fn mzdata_converter() -> Command {
     Command::new(env!("CARGO_BIN_EXE_mzdata-converter"))
 }
 
+// Guards check-then-extract below: cargo test runs tests in parallel threads,
+// and two tests can share the same archive. Without this lock both threads
+// see the target dir missing and race to `tar xzf` into it concurrently,
+// which on Windows fails with "Can't unlink already-existing object".
+static EXTRACT_LOCK: Mutex<()> = Mutex::new(());
+
 /// Extract a `.tar.gz` archive if the target directory doesn't exist yet.
 /// Returns the path to the extracted directory.
 fn ensure_extracted(archive: &str) -> Option<PathBuf> {
+    let _guard = EXTRACT_LOCK.lock().unwrap();
+
     let archive_path = Path::new(archive);
     if !archive_path.exists() {
         eprintln!("Skipping test: {archive} not found");
