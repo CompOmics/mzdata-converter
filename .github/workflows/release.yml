@@ -64,6 +64,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: mzdata-converter-*
           merge-multiple: true
 
       - name: Upload assets to release
