@@ -524,6 +524,12 @@ fn convert_file(
     let total = reader.len() as u64;
     pb.set_length(total);
 
+    // mzdata bug workaround: thermorawfilereader stores the parent MS1's 1-based Thermo scan
+    // number in PrecursorT::parent_index, but make_native_id() adds 1 treating it as 0-based.
+    // Result: every MS2 spectrumRef points to its own scan instead of its parent MS1.
+    // Fix: track the last MS1 native ID ourselves and override precursor_id for each MS2.
+    let fix_thermo_precursor_refs = matches!(reader, MZReader::ThermoRaw(_));
+
     let fh = BufWriter::with_capacity(
         WRITER_BUF_SIZE,
         fs::File::create(output)
@@ -561,7 +567,23 @@ fn convert_file(
             }
         });
 
-        for batch in rx {
+        let mut last_ms1_id = String::new();
+        for mut batch in rx {
+            if fix_thermo_precursor_refs {
+                for spectrum in &mut batch {
+                    if spectrum.description.ms_level == 1 {
+                        last_ms1_id = spectrum.description.id.clone();
+                    } else if spectrum.description.ms_level > 1 {
+                        for precursor in &mut spectrum.description.precursor {
+                            precursor.precursor_id = if last_ms1_id.is_empty() {
+                                None
+                            } else {
+                                Some(last_ms1_id.clone())
+                            };
+                        }
+                    }
+                }
+            }
             process_and_write_batch(batch, do_peak_picking, sn_threshold, &mut writer, pb)?;
         }
 
