@@ -16,6 +16,9 @@ use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::info;
 use mzdata::MZReader;
 use mzdata::io::mzml::MzMLWriterType;
+use mzdata::meta::{
+    DataProcessing, FormatConversion, ProcessingMethod, Software, custom_software_name,
+};
 use mzdata::prelude::*;
 use mzdata::spectrum::MultiLayerSpectrum;
 use mzdata::spectrum::bindata::BinaryCompressionType;
@@ -116,6 +119,36 @@ fn is_bruker_dir(path: &Path) -> bool {
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("d"))
         && path.join("analysis.tdf").exists()
+}
+
+/// Ensure the output has a valid data-processing record and corresponding
+/// software reference, even when the input reader provides no processing
+/// metadata (as is common for vendor RAW readers).
+fn ensure_default_data_processing<W: std::io::Write>(writer: &mut MzMLWriterType<W>) {
+    if !writer.data_processings().is_empty() {
+        return;
+    }
+
+    let software_id = Software::find_unique_id("mzdata_converter", writer.softwares());
+    let mut software = Software {
+        id: software_id.clone(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        ..Default::default()
+    };
+    software.add_param(custom_software_name("mzdata-converter"));
+    writer.softwares_mut().push(software);
+
+    let mut method = ProcessingMethod {
+        order: 0,
+        software_reference: software_id,
+        ..Default::default()
+    };
+    method.add_param(FormatConversion::ConversionToMzML.into());
+
+    writer.data_processings_mut().push(DataProcessing {
+        id: "mzdata_conversion".to_string(),
+        methods: vec![method],
+    });
 }
 
 /// Parameters for building a spectrum in the Bruker SDK path.
@@ -288,6 +321,7 @@ fn convert_bruker_sdk(
             .with_context(|| format!("Failed to create: {}", output.display()))?,
     );
     let mut writer = MzMLWriterType::new_with_index_and_compression(fh, true, compression);
+    ensure_default_data_processing(&mut writer);
 
     // Note: we don't populate source file or instrument metadata here because
     // MzMLWriterType panics on empty InstrumentConfiguration components.
@@ -545,6 +579,7 @@ fn convert_file(
     writer
         .instrument_configurations
         .retain(|_, ic| !ic.components.is_empty());
+    ensure_default_data_processing(&mut writer);
     writer.set_spectrum_count(total);
 
     {

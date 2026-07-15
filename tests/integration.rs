@@ -4,6 +4,7 @@
 //! in `tests/data/`. Archives are extracted before each test. Extracted
 //! directories are gitignored.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -177,6 +178,38 @@ fn test_missing_input_fails() {
         .expect("Failed to run mzdata-converter");
 
     assert!(!result.status.success(), "Should fail on missing input");
+}
+
+#[test]
+fn test_mgf_output_has_default_data_processing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let input = temp_dir.path().join("sample.mgf");
+    fs::write(
+        &input,
+        "BEGIN IONS\nTITLE=default-processing\nPEPMASS=445.34 1000\nCHARGE=2+\nRTINSECONDS=60\n100.0 10.0\n200.0 20.0\nEND IONS\n",
+    )
+    .unwrap();
+
+    let output_dir = tempfile::tempdir().unwrap();
+    let result = mzdata_converter()
+        .arg(&input)
+        .arg("-o")
+        .arg(output_dir.path())
+        .output()
+        .expect("Failed to run mzdata-converter");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(result.status.success(), "Conversion failed: {stderr}");
+
+    let output = output_dir.path().join("sample.mzML");
+    let content = fs::read_to_string(output).unwrap();
+    assert!(content.contains("<dataProcessingList count=\"1\">"));
+    assert!(content.contains("<dataProcessing id=\"mzdata_conversion\">"));
+    assert_eq!(
+        content
+            .matches("defaultDataProcessingRef=\"mzdata_conversion\"")
+            .count(),
+        2
+    );
 }
 
 #[test]
