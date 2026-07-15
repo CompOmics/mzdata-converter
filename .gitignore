@@ -21,3 +21,5 @@ CLAUDE*
 tests/data/*/
 !tests/data/*.tar.gz
 !tests/data/*.raw
+
+temp/

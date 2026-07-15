@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::{fs, io::Read};
 
 fn mzdata_converter() -> Command {
     Command::new(env!("CARGO_BIN_EXE_mzdata-converter"))
@@ -21,7 +22,9 @@ static EXTRACT_LOCK: Mutex<()> = Mutex::new(());
 /// Extract a `.tar.gz` archive if the target directory doesn't exist yet.
 /// Returns the path to the extracted directory.
 fn ensure_extracted(archive: &str) -> Option<PathBuf> {
-    let _guard = EXTRACT_LOCK.lock().unwrap();
+    let _guard = EXTRACT_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let archive_path = Path::new(archive);
     if !archive_path.exists() {
@@ -36,6 +39,15 @@ fn ensure_extracted(archive: &str) -> Option<PathBuf> {
     let dir_path = Path::new(dir_name);
 
     if !dir_path.exists() {
+        let mut header = [0u8; 64];
+        let bytes_read = fs::File::open(archive_path)
+            .and_then(|mut file| file.read(&mut header))
+            .unwrap_or_default();
+        if header[..bytes_read].starts_with(b"version https://git-lfs.github.com/spec/v1") {
+            eprintln!("Skipping test: {archive} is a Git LFS pointer; fetch Git LFS data first");
+            return None;
+        }
+
         let parent = archive_path.parent().unwrap_or(Path::new("."));
         let filename = archive_path.file_name().unwrap().to_str().unwrap();
         let status = Command::new("tar")
