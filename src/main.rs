@@ -6,11 +6,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::fs;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread;
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::info;
@@ -88,6 +88,61 @@ fn output_path_for(input: &Path, output_dir: Option<&Path>) -> PathBuf {
     match output_dir {
         Some(dir) => dir.join(filename),
         None => input.with_file_name(filename),
+    }
+}
+
+/// Resolve a path as far as possible, including its existing parent directory.
+///
+/// Output files do not necessarily exist yet, so canonicalizing the complete
+/// path alone is not sufficient for detecting collisions.
+fn comparable_path(path: &Path) -> PathBuf {
+    if let Ok(path) = fs::canonicalize(path) {
+        return path;
+    }
+
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(file_name)) => fs::canonicalize(parent)
+            .map(|parent| parent.join(file_name))
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Reject output paths that would overwrite an input or another output.
+fn validate_output_paths(files: &[PathBuf], output_dir: Option<&Path>) -> Result<()> {
+    let mut outputs = std::collections::HashMap::new();
+    for input in files {
+        let output = output_path_for(input, output_dir);
+        let comparable_output = comparable_path(&output);
+
+        if comparable_path(input) == comparable_output {
+            bail!(
+                "Output path would overwrite input {}: {}",
+                input.display(),
+                output.display()
+            );
+        }
+
+        if let Some(previous_input) = outputs.insert(comparable_output, input) {
+            bail!(
+                "Inputs {} and {} resolve to the same output path: {}",
+                previous_input.display(),
+                input.display(),
+                output.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A file-concurrency permit that is returned even when conversion fails.
+struct FileJobPermit {
+    sender: SyncSender<()>,
+}
+
+impl Drop for FileJobPermit {
+    fn drop(&mut self) {
+        let _ = self.sender.send(());
     }
 }
 
@@ -311,9 +366,9 @@ fn convert_bruker_sdk(
                     match sdk.extract_centroided_spectrum(frame.id, 0, frame.num_scans) {
                         Ok(result) => result,
                         Err(e) => {
-                            log::warn!("Skipping MS1 frame {}: {e}", frame.id);
-                            pb.inc(1);
-                            continue;
+                            return Err(e).with_context(|| {
+                                format!("Failed to extract MS1 frame {}", frame.id)
+                            });
                         }
                     };
 
@@ -342,9 +397,9 @@ fn convert_bruker_sdk(
                     let msms_data = match sdk.read_pasef_msms(&precursor_ids) {
                         Ok(data) => data,
                         Err(e) => {
-                            log::warn!("Skipping MS2 precursors for frame {}: {e}", frame.id);
-                            pb.inc(precs.len() as u64);
-                            continue;
+                            return Err(e).with_context(|| {
+                                format!("Failed to read MS2 precursors for frame {}", frame.id)
+                            });
                         }
                     };
 
@@ -352,8 +407,7 @@ fn convert_bruker_sdk(
                         let (mzs, intensities) = match msms_data.get(&p.id) {
                             Some(data) => data,
                             None => {
-                                pb.inc(1);
-                                continue;
+                                bail!("SDK returned no data for precursor {}", p.id);
                             }
                         };
 
@@ -410,15 +464,13 @@ fn convert_bruker_sdk(
                 let window_group = match dia_frame_mapping.get(&frame.id) {
                     Some(&group) => group,
                     None => {
-                        log::warn!("No window group for DIA frame {}", frame.id);
-                        continue;
+                        bail!("No window group for DIA frame {}", frame.id);
                     }
                 };
                 let windows = match dia_windows.get(&window_group) {
                     Some(w) => w,
                     None => {
-                        log::warn!("No windows for group {window_group} in frame {}", frame.id);
-                        continue;
+                        bail!("No windows for group {window_group} in frame {}", frame.id);
                     }
                 };
 
@@ -430,9 +482,9 @@ fn convert_bruker_sdk(
                     ) {
                         Ok(result) => result,
                         Err(e) => {
-                            log::warn!("Skipping DIA window in frame {}: {e}", frame.id);
-                            pb.inc(1);
-                            continue;
+                            return Err(e).with_context(|| {
+                                format!("Failed to extract DIA window in frame {}", frame.id)
+                            });
                         }
                     };
 
@@ -480,6 +532,14 @@ fn convert_bruker_sdk(
             // Other frame types — skip
             _ => {}
         }
+    }
+
+    if spectrum_index as u64 != total {
+        bail!(
+            "Bruker conversion produced {} spectra, expected {}",
+            spectrum_index,
+            total
+        );
     }
 
     writer.close()?;
@@ -568,6 +628,7 @@ fn convert_file(
         });
 
         let mut last_ms1_id = String::new();
+        let mut written = 0u64;
         for mut batch in rx {
             if fix_thermo_precursor_refs {
                 for spectrum in &mut batch {
@@ -584,10 +645,21 @@ fn convert_file(
                     }
                 }
             }
-            process_and_write_batch(batch, do_peak_picking, sn_threshold, &mut writer, pb)?;
+            written +=
+                process_and_write_batch(batch, do_peak_picking, sn_threshold, &mut writer, pb)?;
         }
 
-        reader_handle.join().expect("reader thread panicked");
+        reader_handle
+            .join()
+            .map_err(|_| anyhow!("reader thread panicked"))?;
+
+        if written != total {
+            bail!(
+                "Reader ended before all spectra were written: wrote {}, expected {}",
+                written,
+                total
+            );
+        }
     }
 
     writer.close()?;
@@ -601,24 +673,24 @@ fn process_and_write_batch<W: std::io::Write>(
     sn_threshold: f32,
     writer: &mut MzMLWriterType<W>,
     pb: &ProgressBar,
-) -> Result<()> {
-    let batch = if do_peak_picking {
-        batch
-            .into_par_iter()
-            .map(|mut s| {
-                let _ = s.pick_peaks(sn_threshold);
-                s
-            })
-            .collect()
-    } else {
-        batch
-    };
+) -> Result<u64> {
+    let mut batch = batch;
+    if do_peak_picking {
+        batch.par_iter_mut().try_for_each(|s| -> Result<()> {
+            if s.arrays.is_some() {
+                s.pick_peaks(sn_threshold).map_err(|e| {
+                    anyhow!("Failed to peak-pick spectrum {}: {e}", s.description.id)
+                })?;
+            }
+            Ok(())
+        })?;
+    }
     let count = batch.len() as u64;
     for spectrum in batch {
         writer.write_owned(spectrum)?;
     }
     pb.inc(count);
-    Ok(())
+    Ok(count)
 }
 
 fn main() -> Result<()> {
@@ -639,6 +711,12 @@ fn main() -> Result<()> {
         fs::create_dir_all(dir)
             .with_context(|| format!("Failed to create output directory: {}", dir.display()))?;
     }
+
+    if !cli.sn_threshold.is_finite() || cli.sn_threshold < 0.0 {
+        bail!("--sn-threshold must be a finite, non-negative number");
+    }
+
+    validate_output_paths(&files, cli.output_dir.as_deref())?;
 
     let jobs = cli.jobs.unwrap_or(num_files).max(1);
     let do_peak_picking = !cli.no_peak_picking;
@@ -672,6 +750,7 @@ fn main() -> Result<()> {
 
             thread::spawn(move || -> Result<(PathBuf, u64)> {
                 sem_rx.lock().unwrap().recv().unwrap();
+                let _permit = FileJobPermit { sender: sem_tx };
                 let output = output_path_for(&input, output_dir.as_deref());
 
                 let pb = multi.add(ProgressBar::new(0));
@@ -694,7 +773,6 @@ fn main() -> Result<()> {
                 )?;
 
                 pb.finish_with_message("done");
-                let _ = sem_tx.send(());
                 Ok((output, total))
             })
         })

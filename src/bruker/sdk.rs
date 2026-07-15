@@ -140,7 +140,7 @@ impl TimsDataHandle {
         };
 
         if ret == 0 {
-            log::warn!("SDK centroid extraction returned 0 for frame {frame_id}");
+            bail!("SDK centroid extraction returned 0 for frame {frame_id}");
         }
 
         Ok((data.mzs, data.intensities))
@@ -186,7 +186,7 @@ impl TimsDataHandle {
         };
 
         if ret == 0 {
-            log::warn!("SDK read_pasef_msms returned 0");
+            bail!("SDK read_pasef_msms returned 0");
         }
 
         Ok(data.spectra)

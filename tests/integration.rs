@@ -4,6 +4,7 @@
 //! in `tests/data/`. Archives are extracted before each test. Extracted
 //! directories are gitignored.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -177,6 +178,44 @@ fn test_missing_input_fails() {
         .expect("Failed to run mzdata-converter");
 
     assert!(!result.status.success(), "Should fail on missing input");
+}
+
+#[test]
+fn test_multiple_failures_do_not_deadlock() {
+    let first = tempfile::NamedTempFile::new().unwrap();
+    let second = tempfile::NamedTempFile::new().unwrap();
+    let result = mzdata_converter()
+        .arg(first.path())
+        .arg(second.path())
+        .args(["-j", "1"])
+        .output()
+        .expect("Failed to run mzdata-converter");
+
+    assert!(!result.status.success(), "Should fail on missing inputs");
+}
+
+#[test]
+fn test_does_not_overwrite_mzml_input() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let input = temp_dir.path().join("sample.mzML");
+    let original = b"not an mzML document";
+    fs::write(&input, original).unwrap();
+
+    let result = mzdata_converter()
+        .arg(&input)
+        .output()
+        .expect("Failed to run mzdata-converter");
+
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success(),
+        "Should reject an in-place conversion"
+    );
+    assert!(
+        stderr.contains("overwrite input"),
+        "Unexpected error: {stderr}"
+    );
+    assert_eq!(fs::read(&input).unwrap(), original);
 }
 
 #[test]
